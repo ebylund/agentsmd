@@ -72,4 +72,4 @@ Just keep swimming. But write it down first.
 
 ## Learn More
 
-Read the full philosophy: [Working with Dory: Context Rot and the Sleeping Agent](#) *(link to blog post)*
+Read the full philosophy on my blog: [Working with Dory: Context Rot and the Sleeping Agent](https://erikbylund.com/blog/2026-02-03-working-with-dory-context-rot-and-the-sleeping-agent/)
