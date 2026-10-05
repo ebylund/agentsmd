@@ -48,6 +48,28 @@ Dory knows she forgets. She's made peace with it. That's why she's religious abo
 
 ---
 
+## Project Classification
+
+> **Project:** [Not yet defined]
+> **Summary:** [Not yet defined]
+> **Constraints:** [Captured from bootstrap — what rules govern how code is written]
+> **Bootstrap date:** [Not yet bootstrapped]
+
+This section is filled in during the bootstrap conversation (see `~/code/.claude/skills/bootstrap-project/`). Until it's filled in, you are in bootstrap mode — start talking before writing code.
+
+---
+
+## Codebase
+
+This project is part of a managed code folder at `~/code/`.
+
+| Resource | Purpose |
+|----------|---------|
+| `~/code/INDEX.md` | Registry of all projects — state, tags, summaries |
+| `~/code/.claude/skills/` | Lifecycle skills — bootstrap, survey, audit, tag, archive, promote |
+
+---
+
 ## Context Management
 
 Your external memory. Treat it as such.
