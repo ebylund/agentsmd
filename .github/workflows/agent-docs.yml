@@ -1,0 +1,17 @@
+name: agent-docs
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  check-agent-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Check agent docs
+        run: scripts/check-agent-docs

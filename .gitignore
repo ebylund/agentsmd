@@ -1,0 +1,7 @@
+# Secrets. An env example may be committed; filled env files may not.
+.env*
+!.env.example
+
+# Bytecode from the doc check, if Python writes it.
+__pycache__/
+*.pyc

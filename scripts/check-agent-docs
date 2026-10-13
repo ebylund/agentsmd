@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Check the agent-doc contract for this repository.
+
+Exits 0 when the contract holds. A root or nested AGENTS.md over 100 lines
+prints a warning. Over 150 lines is a failure.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+AIM_LINES = 100
+MAX_LINES = 150
+STATUSES = ("draft", "ready", "in-progress", "blocked", "done")
+SKILL_SECTIONS = ("Who", "When to load", "How", "Checks")
+WORK_SECTIONS = (
+    "Outcome",
+    "Acceptance criteria",
+    "Handoff",
+    "Pickup",
+    "Result",
+)
+KNOWN_FILES = {"AGENTS.md", "CLAUDE.md", "README.md", ".gitignore"}
+SKIP_CODE_CHARS = set(" <>*|${}()[]")
+
+LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+CODE_RE = re.compile(r"`([^`\n]+)`")
+URL_RE = re.compile(r"https?://\S+|mailto:\S+")
+ABS_RE = re.compile(r"(?<![\w:])/(?:[\w.@+-]+/)+[\w.@+-]+")
+TILDE_RE = re.compile(r"~[/\\]")
+HOME_ENV_RE = re.compile(r"\$\{?HOME\}?|%USERPROFILE%")
+WIN_RE = re.compile(r"\b[A-Za-z]:\\")
+DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+
+
+def self_test() -> None:
+    """Fail the checker itself if the path detector goes soft."""
+    home = "/" + "home" + "/" + "person" + "/" + "notes"
+    users = "/" + "Users" + "/" + "person" + "/" + "notes"
+    tilde = "~" + "/" + "vault"
+    windows = "C:" + "\\" + "notes"
+    env = "$" + "HOME" + "/" + "notes"
+    assert forbidden_in(home), home
+    assert forbidden_in(users), users
+    assert forbidden_in(tilde), tilde
+    assert forbidden_in(windows), windows
+    assert forbidden_in(env), env
+    assert not forbidden_in("https://agents.md/foo/bar")
+    assert not forbidden_in("context/work/0001-example-work-item.md")
+    assert not forbidden_in("aim for 100 lines, hard max 150")
+    sample = """
+## Hard rules
+
+| Rule | Incident | Check |
+| --- | --- | --- |
+| Example | Something happened, recorded 2026-10-13 | `scripts/check-agent-docs` |
+| Judgment | Something else, recorded 2026-10-13 | (judgment) |
+"""
+    assert parse_hard_rules(sample) == [], parse_hard_rules(sample)
+    broken = sample.replace("2026-10-13", "no-date")
+    assert parse_hard_rules(broken), "a row without a date must fail"
+
+
+def find_repo() -> Path:
+    here = Path(__file__).resolve().parent.parent
+    if (here / ".git").exists():
+        return here
+    sys.exit("scripts/check-agent-docs: repository root not found")
+
+
+def forbidden_in(text: str) -> bool:
+    stripped = URL_RE.sub(" ", text)
+    return any(
+        pattern.search(stripped)
+        for pattern in (ABS_RE, TILDE_RE, HOME_ENV_RE, WIN_RE)
+    )
+
+
+def tracked_and_worktree_markdown(repo: Path) -> list[Path]:
+    files = [
+        path
+        for path in repo.rglob("*.md")
+        if ".git" not in path.parts and path.is_file()
+    ]
+    return sorted(files)
+
+
+def extra_text_files(repo: Path) -> list[Path]:
+    found: list[Path] = []
+    gitignore = repo / ".gitignore"
+    if gitignore.is_file():
+        found.append(gitignore)
+    workflow_dir = repo / ".github" / "workflows"
+    if workflow_dir.is_dir():
+        found.extend(sorted(workflow_dir.glob("*")))
+    return [path for path in found if path.is_file()]
+
+
+def check_case(repo: Path) -> list[str]:
+    errors: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo):
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        buckets: dict[str, set[str]] = {}
+        for name in dirnames + filenames:
+            buckets.setdefault(name.lower(), set()).add(name)
+        rel_dir = Path(dirpath).relative_to(repo)
+        for lower, variants in sorted(buckets.items()):
+            if len(variants) > 1:
+                shown = ", ".join(sorted(variants))
+                errors.append(f"case collision in {rel_dir or '.'}: {shown}")
+        for name in filenames:
+            if name.lower() == "agents.md" and name != "AGENTS.md":
+                rel = (rel_dir / name).as_posix()
+                errors.append(f"rename {rel} to AGENTS.md (exact case)")
+    if not (repo / "AGENTS.md").is_file():
+        errors.append("missing root AGENTS.md")
+    listed = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    paths = [item.decode() for item in listed.stdout.split(b"\0") if item]
+    index_buckets: dict[tuple[str, str], set[str]] = {}
+    for path in paths:
+        parent, name = os.path.split(path)
+        index_buckets.setdefault((parent, name.lower()), set()).add(name)
+    for (parent, _lower), names in sorted(index_buckets.items()):
+        if len(names) > 1:
+            where = parent or "."
+            errors.append(
+                "git index case collision in "
+                f"{where}: {', '.join(sorted(names))}"
+            )
+    return errors
+
+
+def check_line_budget(repo: Path, warnings: list[str]) -> list[str]:
+    errors: list[str] = []
+    files = sorted(repo.rglob("AGENTS.md"))
+    if not files:
+        return ["missing AGENTS.md"]
+    for path in files:
+        if ".git" in path.parts:
+            continue
+        count = len(path.read_text(encoding="utf-8").splitlines())
+        rel = path.relative_to(repo).as_posix()
+        if count > MAX_LINES:
+            errors.append(
+                f"{rel} has {count} lines; hard max is {MAX_LINES} (aim {AIM_LINES})"
+            )
+        elif count > AIM_LINES:
+            warnings.append(
+                f"{rel} has {count} lines; aim is {AIM_LINES}, hard max is {MAX_LINES}"
+            )
+    return errors
+
+
+def check_forbidden_paths(repo: Path) -> list[str]:
+    errors: list[str] = []
+    files = tracked_and_worktree_markdown(repo) + extra_text_files(repo)
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        if forbidden_in(text):
+            rel = path.relative_to(repo).as_posix()
+            errors.append(f"{rel} contains an absolute or home-directory path")
+    return errors
+
+
+def reference_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for match in LINK_RE.finditer(text):
+        tokens.append(match.group(1).strip())
+    for match in CODE_RE.finditer(text):
+        tokens.append(match.group(1).strip())
+    return tokens
+
+
+def path_candidates(token: str) -> list[str]:
+    if token.startswith("@"):
+        token = token[1:]
+    token = token.split("#", 1)[0].strip()
+    if not token or token.startswith(("http://", "https://", "mailto:", "#")):
+        return []
+    if any(char in token for char in SKIP_CODE_CHARS):
+        return []
+    if token.startswith(("./", "../")) or "/" in token or token in KNOWN_FILES:
+        return [token]
+    return []
+
+
+def check_references(repo: Path) -> list[str]:
+    errors: list[str] = []
+    root = repo.resolve()
+    for path in tracked_and_worktree_markdown(repo):
+        text = path.read_text(encoding="utf-8")
+        for token in reference_tokens(text):
+            for candidate in path_candidates(token):
+                if candidate.startswith("../") or "/../" in candidate:
+                    rel = path.relative_to(repo).as_posix()
+                    errors.append(f"{rel} escapes the repo: {candidate}")
+                    continue
+                options = [repo / candidate, path.parent / candidate]
+                kept: list[Path] = []
+                escaped = False
+                for option in options:
+                    try:
+                        option.resolve().relative_to(root)
+                    except ValueError:
+                        escaped = True
+                        continue
+                    kept.append(option)
+                if escaped and not kept:
+                    rel = path.relative_to(repo).as_posix()
+                    errors.append(f"{rel} escapes the repo: {candidate}")
+                    continue
+                if not any(option.exists() for option in kept):
+                    rel = path.relative_to(repo).as_posix()
+                    errors.append(f"{rel} references missing path {candidate}")
+    return errors
+
+
+def check_claude(repo: Path) -> list[str]:
+    path = repo / "CLAUDE.md"
+    if not path.is_file():
+        return ["missing CLAUDE.md (the one-line @AGENTS.md pointer)"]
+    if path.read_text(encoding="utf-8").strip() != "@AGENTS.md":
+        return ["CLAUDE.md must be exactly the line @AGENTS.md"]
+    return []
+
+
+def check_session_state(repo: Path) -> list[str]:
+    errors: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo):
+        if ".git" in dirnames:
+            dirnames.remove(".git")
+        for name in filenames:
+            if name.lower() == "session-state.md":
+                rel = (Path(dirpath) / name).relative_to(repo).as_posix()
+                errors.append(f"remove {rel}; git is the session state")
+    return errors
+
+
+def git_ignored(repo: Path, path: str) -> bool:
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--", path],
+        cwd=repo,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        sys.exit(f"git check-ignore failed for {path}")
+    return result.returncode == 0
+
+
+def check_gitignore(repo: Path) -> list[str]:
+    if not (repo / ".gitignore").is_file():
+        return ["missing .gitignore"]
+    errors: list[str] = []
+    for secret in (".env", ".env.local", ".env.production"):
+        if not git_ignored(repo, secret):
+            errors.append(f".gitignore does not ignore {secret}")
+    if git_ignored(repo, ".env.example"):
+        errors.append(".gitignore ignores .env.example; keep that file committable")
+    return errors
+
+
+def parse_hard_rules(text: str) -> list[str]:
+    errors: list[str] = []
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == "## Hard rules":
+            start = index + 1
+            break
+    if start is None:
+        return ["AGENTS.md is missing the Hard rules section"]
+    header = None
+    for line in lines[start:]:
+        if line.startswith("| Rule |"):
+            header = line
+            break
+        if line.startswith("## "):
+            break
+    if header is None:
+        return ["AGENTS.md Hard rules section is missing its table"]
+    in_table = False
+    saw_row = False
+    for line in lines[start:]:
+        if line.startswith("## ") and in_table:
+            break
+        if not line.startswith("|"):
+            if in_table:
+                break
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if cells == ["Rule", "Incident", "Check"]:
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if cells and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+            continue
+        saw_row = True
+        if len(cells) != 3:
+            errors.append(f"hard-rule row needs 3 cells: {line}")
+            continue
+        _rule, incident, check = cells
+        match = DATE_RE.search(incident)
+        if match is None:
+            errors.append(f"hard rule is missing an incident date: {_rule}")
+        else:
+            try:
+                dt.date.fromisoformat(match.group(1))
+            except ValueError:
+                errors.append(f"hard rule has a bad incident date: {_rule}")
+        if "(judgment)" not in check and "`" not in check:
+            errors.append(
+                f"hard rule needs a check path or (judgment): {_rule}"
+            )
+    if not saw_row:
+        errors.append("Hard rules table has no rules")
+    return errors
+
+
+def check_hard_rules(repo: Path) -> list[str]:
+    path = repo / "AGENTS.md"
+    if not path.is_file():
+        return ["missing AGENTS.md"]
+    return parse_hard_rules(path.read_text(encoding="utf-8"))
+
+
+def section_body(text: str, title: str) -> str | None:
+    match = re.search(
+        rf"(?m)^## {re.escape(title)}\s*\n(.*?)(?=^## |\Z)",
+        text,
+        re.S,
+    )
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def skill_tokens(text: str) -> list[str]:
+    skills = re.search(r"(?m)^- Skills:\s*(.+)$", text)
+    if skills is None:
+        return []
+    tokens: list[str] = []
+    for token in re.split(r"[\s,]+", skills.group(1).strip()):
+        token = token.strip("`")
+        if token in {"", "none", "n/a"}:
+            continue
+        if "/" in token or token.endswith(".md"):
+            tokens.append(token)
+    return tokens
+
+
+def check_work_item(rel: str, text: str) -> list[str]:
+    errors: list[str] = []
+    status_re = "|".join(re.escape(status) for status in STATUSES)
+    fields = {
+        "Status": rf"(?m)^- Status: ({status_re})\s*$",
+        "Owner": r"(?m)^- Owner: \S",
+        "Executor": r"(?m)^- Executor: \S",
+        "Change class": r"(?m)^- Change class: [0-3]\s*$",
+        "Skills": r"(?m)^- Skills: \S",
+    }
+    for label, pattern in fields.items():
+        if re.search(pattern, text) is None:
+            errors.append(f"{rel} is missing field {label}")
+    for title in WORK_SECTIONS:
+        body = section_body(text, title)
+        if body is None:
+            errors.append(f"{rel} is missing section {title}")
+        elif not body:
+            errors.append(f"{rel} section {title} is empty")
+    return errors
+
+
+def check_skills_and_work(repo: Path) -> list[str]:
+    errors: list[str] = []
+    agents = repo / "AGENTS.md"
+    agents_text = agents.read_text(encoding="utf-8") if agents.is_file() else ""
+    for status in STATUSES:
+        if f"`{status}`" not in agents_text:
+            errors.append(f"AGENTS.md does not name work-item status `{status}`")
+    context = repo / "context"
+    if not context.is_dir():
+        return errors
+    for path in sorted(context.rglob("*.md")):
+        rel = path.relative_to(repo).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if rel.startswith("context/work/"):
+            errors.extend(check_work_item(rel, text))
+            for token in skill_tokens(text):
+                if not (repo / token).exists():
+                    errors.append(f"{rel} names missing skill {token}")
+            continue
+        for title in SKILL_SECTIONS:
+            body = section_body(text, title)
+            if body is None:
+                errors.append(f"{rel} is missing section {title}")
+            elif not body:
+                errors.append(f"{rel} section {title} is empty")
+        if rel not in agents_text:
+            errors.append(f"{rel} is not indexed in AGENTS.md")
+    return errors
+
+
+def main() -> int:
+    self_test()
+    repo = find_repo()
+    warnings: list[str] = []
+    errors: list[str] = []
+    errors.extend(check_case(repo))
+    errors.extend(check_line_budget(repo, warnings))
+    errors.extend(check_forbidden_paths(repo))
+    errors.extend(check_references(repo))
+    errors.extend(check_claude(repo))
+    errors.extend(check_session_state(repo))
+    errors.extend(check_gitignore(repo))
+    errors.extend(check_hard_rules(repo))
+    errors.extend(check_skills_and_work(repo))
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    if errors:
+        for error in errors:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+    root_lines = len((repo / "AGENTS.md").read_text(encoding="utf-8").splitlines())
+    print(f"check-agent-docs: ok (AGENTS.md {root_lines} lines, aim {AIM_LINES}, max {MAX_LINES})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
